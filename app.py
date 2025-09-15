@@ -4,6 +4,9 @@ import os
 import uuid
 import gc
 import torch
+from collections import namedtuple
+from typing import List, Iterator
+SegmentTuple = namedtuple('SegmentTuple', ['start', 'end', 'text'])
 
 app = Flask(__name__)
 
@@ -23,6 +26,71 @@ def format_timestamp(seconds):
     s = int(seconds % 60)
     ms = int((seconds - int(seconds)) * 1000)
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+def split_long_segments(transcribe_result: Iterator, max_duration: int = 8) -> List:
+    """
+    Splits long subtitle segments from Whisper's result into smaller chunks.
+
+    Args:
+        transcribe_result: The raw result from model.transcribe().
+        max_duration: The maximum duration (in seconds) for each subtitle segment.
+
+    Returns:
+        A new list of segments, where all segments adhere to the max_duration.
+    """
+    new_segments = []
+    original_segments = list(transcribe_result)
+
+    for segment in original_segments:
+        # If the segment has no word timestamps or is already short enough, add it as is
+        # CORRECTED: Use attribute access (segment.words) instead of dict access (segment['words'])
+        if not segment.words or (segment.end - segment.start) <= max_duration:
+            new_segments.append(segment)
+            continue
+
+        # If the segment is too long, split it based on word timestamps
+        current_sub_segment_start_time = segment.start
+        current_sub_segment_text = ""
+        words_in_sub_segment = []
+
+        # CORRECTED: Iterate through segment.words
+        for word in segment.words:
+            # CORRECTED: Use attribute access for word data (word.end, word.start, word.word)
+            word_start, word_end, word_text = word.start, word.end, word.word
+
+            # If adding the current word would exceed the max duration, finalize the current sub-segment
+            if word_end is not None and (word_end - current_sub_segment_start_time > max_duration):
+                if words_in_sub_segment:
+                    # Create a new segment and add it to our list
+                    # CORRECTED: Create a SegmentTuple object instead of a dictionary
+                    # to maintain attribute access (.start, .end, .text)
+                    last_word_end = words_in_sub_segment[-1].end
+                    new_segments.append(SegmentTuple(
+                        start=current_sub_segment_start_time,
+                        end=last_word_end,
+                        text=current_sub_segment_text.strip()
+                    ))
+
+                # Start a new sub-segment with the current word
+                current_sub_segment_start_time = word_start
+                current_sub_segment_text = word_text
+                words_in_sub_segment = [word]
+            else:
+                # Otherwise, continue adding words to the current sub-segment
+                current_sub_segment_text += word_text
+                words_in_sub_segment.append(word)
+
+        # Add the final sub-segment after the loop finishes
+        if words_in_sub_segment:
+            last_word_end = words_in_sub_segment[-1].end
+            # CORRECTED: Also create a SegmentTuple for the last part
+            new_segments.append(SegmentTuple(
+                start=current_sub_segment_start_time,
+                end=last_word_end,
+                text=current_sub_segment_text.strip()
+            ))
+
+    return new_segments
 
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
@@ -48,7 +116,10 @@ def transcribe():
         
         # 2. 处理音频并生成SRT
         print(f"Transcribing file: {filepath}")
-        segments, info = model.transcribe(filepath, beam_size=5)
+        segments, info = model.transcribe(filepath, beam_size=5, word_timestamps=True, vad_filter=True)
+
+        # 3. 裁切过大分段
+        # segments = split_long_segments(segments, max_duration=6)
 
         print(f"Detected language '{info.language}' with probability {info.language_probability}")
 
